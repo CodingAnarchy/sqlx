@@ -351,6 +351,7 @@ jobs:
       # Create data dir for offline mode
       - run: mkdir .sqlx
 
+      # Run tests without template cloning
       - run: >
           cargo test
           --no-default-features
@@ -358,6 +359,17 @@ jobs:
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx?ssl-mode=disabled
           SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
+
+      # Run tests with template cloning enabled
+      - run: >
+          cargo test
+          --no-default-features
+          --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+        env:
+          DATABASE_URL: mysql://root:password@localhost:3306/sqlx?ssl-mode=disabled
+          SQLX_OFFLINE_DIR: .sqlx
+          SQLX_TEST_TEMPLATE: 1
           RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
 
       # Run the `test-attr` test again to cover cleanup.
@@ -371,7 +383,7 @@ jobs:
           SQLX_OFFLINE_DIR: .sqlx
           RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
 
-      # Run template database cloning tests
+      # Run template database cloning tests (only with template cloning enabled)
       - run: >
           cargo test
           --test mysql-template
@@ -380,6 +392,7 @@ jobs:
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx?ssl-mode=disabled
           SQLX_OFFLINE_DIR: .sqlx
+          SQLX_TEST_TEMPLATE: 1
           RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
 
       # MySQL 5.7 supports TLS but not TLSv1.3 as required by RusTLS.
@@ -463,6 +476,7 @@ jobs:
       # Create data dir for offline mode
       - run: mkdir .sqlx
 
+      # Run tests without template cloning
       - run: >
           cargo test
           --no-default-features
@@ -470,6 +484,17 @@ jobs:
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx
           SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
+
+      # Run tests with template cloning enabled
+      - run: >
+          cargo test
+          --no-default-features
+          --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+        env:
+          DATABASE_URL: mysql://root:password@localhost:3306/sqlx
+          SQLX_OFFLINE_DIR: .sqlx
+          SQLX_TEST_TEMPLATE: 1
           RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
 
       # Run the `test-attr` test again to cover cleanup.
@@ -483,7 +508,7 @@ jobs:
           SQLX_OFFLINE_DIR: .sqlx
           RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
 
-      # Run template database cloning tests
+      # Run template database cloning tests (only with template cloning enabled)
       - run: >
           cargo test
           --test mysql-template
@@ -492,6 +517,7 @@ jobs:
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx
           SQLX_OFFLINE_DIR: .sqlx
+          SQLX_TEST_TEMPLATE: 1
           RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
 
       # Remove test artifacts

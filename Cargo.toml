@@ -356,6 +356,19 @@ required-features = ["sqlite"]
 # MySQL
 #
 
+[[bench]]
+name = "mysql-template"
+path = "benches/mysql/template.rs"
+harness = false
+required-features = ["mysql", "runtime-tokio"]
+
+# Temporary benchmark for CDP codebase - requires local shopify-cdp repo
+[[bench]]
+name = "mysql-cdp-template"
+path = "benches/mysql/cdp_template.rs"
+harness = false
+required-features = ["mysql", "runtime-tokio"]
+
 [[test]]
 name = "mysql"
 path = "tests/mysql/mysql.rs"

@@ -1,10 +1,14 @@
-// Tests for template database cloning functionality in MySQL.
+// Integration tests for template database cloning functionality in MySQL.
 //
-// These tests verify that:
+// These tests require a database connection and verify end-to-end template
+// functionality including:
 // 1. Template databases are created when migrations are used
 // 2. Multiple tests with the same migrations share a template
-// 3. SQLX_TEST_NO_TEMPLATE disables template cloning
-// 4. Different migrations create different templates
+// 3. SQLX_TEST_TEMPLATE enables template cloning (opt-in)
+// 4. Fixtures are applied per-test, not stored in template
+//
+// Unit tests for migrations_hash() and template_db_name() are in
+// sqlx-core/src/testing/mod.rs
 
 use sqlx::mysql::MySqlPool;
 use sqlx::Connection;
@@ -25,8 +29,7 @@ async fn it_creates_template_database(pool: MySqlPool) -> sqlx::Result<()> {
     .await?;
 
     // If templates are enabled, we should have at least one template
-    // (unless SQLX_TEST_NO_TEMPLATE is set)
-    if std::env::var("SQLX_TEST_NO_TEMPLATE").is_err() {
+    if std::env::var("SQLX_TEST_TEMPLATE").is_ok() {
         assert!(
             template_count > 0,
             "Expected at least one template database to be created"
@@ -49,24 +52,40 @@ async fn it_creates_template_database(pool: MySqlPool) -> sqlx::Result<()> {
 /// exist and contain the migration history.
 #[sqlx::test(migrations = "tests/mysql/migrations")]
 async fn it_clones_migrations_table(pool: MySqlPool) -> sqlx::Result<()> {
-    // Check that _sqlx_migrations table exists and has entries
+    // Count migration files in the migrations directory
+    let migration_dir = std::path::Path::new("tests/mysql/migrations");
+    let expected_count = std::fs::read_dir(migration_dir)
+        .expect("migrations directory should exist")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "sql")
+                .unwrap_or(false)
+        })
+        .count() as i64;
+
+    // Check that _sqlx_migrations table has the expected count
     let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
 
-    // We have 3 migrations in tests/mysql/migrations
     assert_eq!(
-        migration_count, 3,
-        "Expected 3 migrations to be recorded in _sqlx_migrations"
+        migration_count, expected_count,
+        "Migration count in database should match number of migration files"
     );
 
-    // Verify the specific migrations are recorded
+    // Verify the versions form a contiguous sequence starting at 1
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
 
-    assert_eq!(versions, vec![1, 2, 3], "Expected migrations 1, 2, 3");
+    let expected_versions: Vec<i64> = (1..=expected_count).collect();
+    assert_eq!(
+        versions, expected_versions,
+        "Migration versions should be contiguous starting at 1"
+    );
 
     Ok(())
 }
@@ -127,7 +146,7 @@ async fn it_reuses_template_for_same_migrations_2(pool: MySqlPool) -> sqlx::Resu
 /// Verify that template databases have the correct naming pattern.
 #[sqlx::test(migrations = "tests/mysql/migrations")]
 async fn it_names_templates_correctly(_pool: MySqlPool) -> sqlx::Result<()> {
-    if std::env::var("SQLX_TEST_NO_TEMPLATE").is_ok() {
+    if std::env::var("SQLX_TEST_TEMPLATE").is_err() {
         // Skip this test if templates are disabled
         return Ok(());
     }
@@ -195,55 +214,145 @@ async fn it_isolates_fixtures_between_tests(pool: MySqlPool) -> sqlx::Result<()>
     Ok(())
 }
 
-/// Unit test for migrations_hash function - verify it produces consistent hashes.
-#[test]
-fn test_migrations_hash_consistency() {
-    use sqlx_core::migrate::Migrator;
-    use sqlx_core::testing::migrations_hash;
+/// Verify that foreign key constraints are properly cloned from template.
+/// CREATE TABLE ... LIKE doesn't copy FKs, so we have a special step to copy them.
+#[sqlx::test(migrations = "tests/mysql/migrations")]
+async fn it_clones_foreign_key_constraints(pool: MySqlPool) -> sqlx::Result<()> {
+    // Query foreign key constraint names from the cloned database
+    let fk_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT tc.constraint_name
+        FROM information_schema.table_constraints tc
+        WHERE tc.table_schema = database()
+            AND tc.constraint_type = 'FOREIGN KEY'
+        ORDER BY tc.constraint_name
+        "#,
+    )
+    .fetch_all(&pool)
+    .await?;
 
-    // Create a migrator with the test migrations
-    let migrator: Migrator = sqlx::migrate!("tests/mysql/migrations");
-
-    // Hash should be consistent across calls
-    let hash1 = migrations_hash(&migrator);
-    let hash2 = migrations_hash(&migrator);
-
-    assert_eq!(hash1, hash2, "migrations_hash should be deterministic");
-
-    // Hash should be non-empty and reasonable length
-    assert!(!hash1.is_empty(), "hash should not be empty");
-    assert!(
-        hash1.len() < 30,
-        "hash should be reasonably short for use in database names"
+    // We added 3 FKs in migration 4: fk_post_user, fk_comment_post, fk_comment_user
+    assert_eq!(
+        fk_names,
+        vec!["fk_comment_post", "fk_comment_user", "fk_post_user"],
+        "Expected 3 foreign key constraints to be cloned"
     );
+
+    // Verify FK enforcement works - deleting a user should cascade to posts
+    // First insert test data
+    sqlx::query("INSERT INTO user (username) VALUES ('test_fk_user')")
+        .execute(&pool)
+        .await?;
+
+    // Get the inserted user's ID
+    let user_row: (i32,) = sqlx::query_as("SELECT user_id FROM user WHERE username = 'test_fk_user'")
+        .fetch_one(&pool)
+        .await?;
+    let user_id = user_row.0;
+
+    sqlx::query("INSERT INTO post (user_id, content) VALUES (?, 'test post')")
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+
+    // Verify post exists before delete
+    let post_before: Vec<(i32,)> = sqlx::query_as("SELECT post_id FROM post WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await?;
+    assert_eq!(post_before.len(), 1, "Post should exist before cascade delete");
+
+    // Delete user - should cascade to posts
+    sqlx::query("DELETE FROM user WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+
+    // Verify post was also deleted (CASCADE)
+    let post_after: Vec<(i32,)> = sqlx::query_as("SELECT post_id FROM post WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await?;
+    assert_eq!(post_after.len(), 0, "Post should have been cascade deleted");
+
+    Ok(())
 }
 
-/// Unit test for template_db_name function.
-#[test]
-fn test_template_db_name_format() {
-    use sqlx_core::testing::template_db_name;
+/// Verify that AUTO_INCREMENT values are correctly set after template cloning.
+/// When a template has seed data, the cloned database should have AUTO_INCREMENT
+/// set to MAX(id) + 1, allowing new inserts without duplicate key errors.
+#[sqlx::test(migrations = "tests/mysql/migrations")]
+async fn it_preserves_auto_increment_after_clone(pool: MySqlPool) -> sqlx::Result<()> {
+    // The migrations create auto_increment_test table with 3 seed rows (ids 1, 2, 3)
+    // Verify we can insert a new row without duplicate key errors
+    sqlx::query("INSERT INTO auto_increment_test (name) VALUES ('new_test_row')")
+        .execute(&pool)
+        .await?;
 
-    let name = template_db_name("abc123xyz");
+    // Get the ID of the newly inserted row - should be 4 (after seed rows 1, 2, 3)
+    let new_id: i32 =
+        sqlx::query_scalar("SELECT id FROM auto_increment_test WHERE name = 'new_test_row'")
+            .fetch_one(&pool)
+            .await?;
 
-    assert!(
-        name.starts_with("_sqlx_template_"),
-        "template name should have correct prefix"
-    );
-    assert!(
-        name.contains("abc123xyz"),
-        "template name should contain hash"
-    );
-    assert!(
-        name.len() < 63,
-        "template name should fit in MySQL identifier limit"
+    assert_eq!(
+        new_id, 4,
+        "New row should have id=4 (got {}), AUTO_INCREMENT should continue from seed data",
+        new_id
     );
 
-    // Test with special characters that need escaping
-    let name_with_special = template_db_name("a-b+c/d");
+    // Verify the seed rows still exist
+    let seed_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auto_increment_test WHERE name LIKE 'seed_row_%'")
+            .fetch_one(&pool)
+            .await?;
+
+    assert_eq!(seed_count, 3, "Should have 3 seed rows");
+
+    Ok(())
+}
+
+/// Verify that views with dependencies are correctly cloned.
+/// view_user_post_summary depends on view_user_posts, so the cloning
+/// must handle the dependency order (or retry failed views).
+#[sqlx::test(migrations = "tests/mysql/migrations")]
+async fn it_clones_dependent_views(pool: MySqlPool) -> sqlx::Result<()> {
+    // Verify both views exist and are queryable
+    let base_view_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.views WHERE table_schema = database() AND table_name = 'view_user_posts')",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    assert!(base_view_exists, "Base view view_user_posts should exist");
+
+    let dependent_view_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.views WHERE table_schema = database() AND table_name = 'view_user_post_summary')",
+    )
+    .fetch_one(&pool)
+    .await?;
+
     assert!(
-        !name_with_special.contains('-'),
-        "should not contain hyphen"
+        dependent_view_exists,
+        "Dependent view view_user_post_summary should exist"
     );
-    assert!(!name_with_special.contains('+'), "should not contain plus");
-    assert!(!name_with_special.contains('/'), "should not contain slash");
+
+    // Insert test data to verify the views work correctly
+    sqlx::query("INSERT INTO user (username) VALUES ('view_test_user')")
+        .execute(&pool)
+        .await?;
+
+    // Query the dependent view to verify it works correctly
+    let summary: Vec<(i32, String, i64)> = sqlx::query_as(
+        "SELECT user_id, username, post_count FROM view_user_post_summary WHERE username = 'view_test_user'",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    // Should have the test user we just inserted
+    assert_eq!(summary.len(), 1, "Should find exactly one user in view");
+    assert_eq!(summary[0].1, "view_test_user", "Username should match");
+    assert_eq!(summary[0].2, 0, "User should have 0 posts");
+
+    Ok(())
 }

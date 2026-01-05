@@ -318,3 +318,123 @@ async fn setup_test_db<DB: Database>(
         .await
         .expect("failed to close setup connection");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrate::{Migration, MigrationType, Migrator};
+    use crate::sql_str::SqlSafeStr;
+    use std::borrow::Cow;
+
+    fn create_test_migrator(migrations: Vec<Migration>) -> Migrator {
+        Migrator {
+            migrations: Cow::Owned(migrations),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+            table_name: Cow::Borrowed("_sqlx_migrations"),
+            create_schemas: Cow::Borrowed(&[]),
+        }
+    }
+
+    fn create_test_migration(version: i64, sql: &'static str) -> Migration {
+        Migration::new(
+            version,
+            Cow::Borrowed("test migration"),
+            MigrationType::Simple,
+            sql.into_sql_str(),
+            false,
+        )
+    }
+
+    #[test]
+    fn migrations_hash_is_deterministic() {
+        let migrations = vec![
+            create_test_migration(1, "CREATE TABLE users (id INT)"),
+            create_test_migration(2, "CREATE TABLE posts (id INT)"),
+            create_test_migration(3, "ALTER TABLE users ADD name VARCHAR(255)"),
+        ];
+        let migrator = create_test_migrator(migrations);
+
+        // Hash should be consistent across calls
+        let hash1 = migrations_hash(&migrator);
+        let hash2 = migrations_hash(&migrator);
+
+        assert_eq!(hash1, hash2, "migrations_hash should be deterministic");
+
+        // Hash should be non-empty and reasonable length
+        assert!(!hash1.is_empty(), "hash should not be empty");
+        assert!(
+            hash1.len() < 30,
+            "hash should be reasonably short for use in database names"
+        );
+    }
+
+    #[test]
+    fn migrations_hash_changes_with_different_migrations() {
+        let migrations1 = vec![create_test_migration(1, "CREATE TABLE users (id INT)")];
+        let migrations2 = vec![create_test_migration(1, "CREATE TABLE posts (id INT)")];
+
+        let hash1 = migrations_hash(&create_test_migrator(migrations1));
+        let hash2 = migrations_hash(&create_test_migrator(migrations2));
+
+        assert_ne!(hash1, hash2, "different migrations should produce different hashes");
+    }
+
+    #[test]
+    fn migrations_hash_changes_with_version() {
+        let migrations1 = vec![create_test_migration(1, "CREATE TABLE users (id INT)")];
+        let migrations2 = vec![create_test_migration(2, "CREATE TABLE users (id INT)")];
+
+        let hash1 = migrations_hash(&create_test_migrator(migrations1));
+        let hash2 = migrations_hash(&create_test_migrator(migrations2));
+
+        assert_ne!(hash1, hash2, "different versions should produce different hashes");
+    }
+
+    #[test]
+    fn template_db_name_has_correct_format() {
+        let name = template_db_name("abc123xyz");
+
+        assert!(
+            name.starts_with("_sqlx_template_"),
+            "template name should have correct prefix"
+        );
+        assert!(
+            name.contains("abc123xyz"),
+            "template name should contain hash"
+        );
+        assert!(
+            name.len() < 63,
+            "template name should fit in MySQL identifier limit"
+        );
+    }
+
+    #[test]
+    fn template_db_name_escapes_special_characters() {
+        // Test with special characters that need escaping
+        let name_with_special = template_db_name("a-b+c/d");
+
+        assert!(
+            !name_with_special.contains('-'),
+            "should not contain hyphen"
+        );
+        assert!(!name_with_special.contains('+'), "should not contain plus");
+        assert!(!name_with_special.contains('/'), "should not contain slash");
+        assert!(
+            name_with_special.starts_with("_sqlx_template_"),
+            "should still have correct prefix"
+        );
+    }
+
+    #[test]
+    fn template_db_name_handles_empty_hash() {
+        let name = template_db_name("");
+
+        assert!(
+            name.starts_with("_sqlx_template_"),
+            "should have prefix even with empty hash"
+        );
+        assert_eq!(name, "_sqlx_template_");
+    }
+}
